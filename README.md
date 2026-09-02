@@ -31,3 +31,9 @@ npm run dev
 
 The chat WebSocket expects a grtbx bridge at `127.0.0.1:8080`; without one the UI
 renders but cannot hold a conversation.
+
+## Proven live (gritbox/grtbx#56)
+
+The `grtbx-gritbox` Sprite was re-seeded onto a real clone of this repo, then this
+line was added here and pulled into `/data/surface` with `git fetch && git merge`
+— confirming an upstream change reaches a live Sprite without a hand-copy.
