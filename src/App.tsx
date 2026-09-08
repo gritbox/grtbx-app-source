@@ -2,6 +2,7 @@ import { useEffect, useRef, useReducer, useState } from "react";
 import { reducer, initialState, type ToolCall } from "./reducer.ts";
 import { connect, type Conn, type ConnState, type SessionSummary, type ModelSummary, type ModelPromptMap, type WorkspaceSummary } from "./ws.ts";
 import { sheetBody } from "./sheet-state.ts";
+import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
 
 const TOOL_ICON: Record<ToolCall["status"], string> = { running: "", ok: "✓", error: "✗", stopped: "■" };
 const SESSION_KEY = "grtbx:sessionId";
@@ -101,6 +102,11 @@ export function App() {
   const pendingPromptSave = useRef(false);
   // Which (provider, model) the editor's text was seeded from — see the effect.
   const seededFor = useRef<string | null>(null);
+  // ADR-015: once the bridge answers `hello` with `relaying`, Pi's own events
+  // are the transcript and the bridge's translated frames stop, so this holds
+  // the state `agent_end` carries across to `agent_settled` (#77).
+  const piTranslator = useRef(createPiTranslator());
+  const relayingRef = useRef(false);
 
   function handleConnState(s: ConnState) {
     setConn(s);
@@ -113,6 +119,13 @@ export function App() {
     connRef.current?.close();
     connRef.current = connect(
       (m) => {
+        // A relaying socket gets Pi's events verbatim and none of the bridge's
+        // translations, so these ARE the transcript now (ADR-015 clause 5).
+        if (isPiEvent(m as { type?: unknown })) {
+          for (const a of piTranslator.current.handle(m as unknown as PiEvent)) dispatch(a);
+          return;
+        }
+        if (m.type === "seam") { relayingRef.current = m.relaying; return; }
         if (m.type === "token") dispatch({ t: "token", delta: m.delta });
         else if (m.type === "done") dispatch({ t: "done" });
         else if (m.type === "error") {

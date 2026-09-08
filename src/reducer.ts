@@ -43,7 +43,8 @@ export type Action =
   | { t: "done" }
   | { t: "error"; message: string }
   | { t: "load_session"; turns: { role: "user" | "assistant"; text: string }[] }
-  | { t: "disconnected" };
+  | { t: "disconnected" }
+  | { t: "retry_reset" };
 
 /** Find the last assistant message and replace it with `fn`'s result. No-op if none. */
 function updateLastAssistant(msgs: Msg[], fn: (m: Msg) => Msg): Msg[] {
@@ -121,6 +122,17 @@ export function reducer(s: ChatState, a: Action): ChatState {
     case "disconnected": {
       if (!s.streaming) return s; // nothing in flight — a no-op, safe to fire on every state change
       return { ...s, streaming: false, messages: updateLastAssistant(s.messages, stopRunningTools) };
+    }
+    case "retry_reset": {
+      // Pi drops the failed attempt's assistant message before it retries, so
+      // the text it streamed is not part of the conversation and the retried
+      // reply would otherwise arrive glued to the tail of what it replaced.
+      // Clears the text only, matching what the bridge's own translation drops
+      // (`assistantBuf`), so the relay and pre-relay paths render alike; the
+      // attempt's tool rows stay on screen under both, which is worth revisiting
+      // once one path is retired (#9, #10).
+      if (!s.streaming) return s;
+      return { ...s, messages: updateLastAssistant(s.messages, (m) => ({ ...m, text: "" })) };
     }
     case "load_session": {
       let id = 1;

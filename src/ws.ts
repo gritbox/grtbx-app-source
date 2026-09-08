@@ -63,7 +63,29 @@ export type BridgeMsg =
   | { type: "models"; models: ModelSummary[]; current?: { provider: string; modelId: string } }
   | { type: "model_set"; provider: string; modelId: string }
   | { type: "model_prompts"; prompts: ModelPromptMap }
-  | { type: "workspaces"; workspaces: WorkspaceSummary[]; current?: string };
+  | { type: "workspaces"; workspaces: WorkspaceSummary[]; current?: string }
+  | { type: "seam"; version: number; relaying: boolean };
+
+/**
+ * The seam this client speaks (ADR-015). Declared on every `hello`; the bridge
+ * answers with its own `SEAM_VERSION` and whether this socket is relaying.
+ *
+ * Declaring it is not additive. Once relaying, the bridge sends Pi's events
+ * verbatim and STOPS sending the translated `token`/`tool_*`/`done` frames, so
+ * `pi-events.ts` is what keeps the transcript rendering.
+ */
+export const SEAM_VERSION = 1;
+
+/**
+ * A Pi command sent straight down the relay. The bridge checks the name against
+ * its closed list and forwards the rest verbatim — arguments are Pi's business,
+ * and Pi answers every command, including ones it rejects.
+ */
+export interface PiCommand {
+  type: string;
+  id?: string;
+  [k: string]: unknown;
+}
 
 /** provider -> modelId -> the user's framing for that model (#42). */
 export type ModelPromptMap = Record<string, Record<string, string>>;
@@ -104,6 +126,12 @@ export interface Conn {
   setModelPrompt(provider: string, modelId: string, prompt: string): void;
   /** Manual retry affordance for the "offline" (bounded-attempts-exhausted) state. */
   reconnect(): void;
+  /**
+   * Send one of Pi's own commands down the relay (ADR-015). Only meaningful once
+   * the bridge has answered `hello` with `seam.relaying`; before that the bridge
+   * refuses the name, so callers gate on the seam frame rather than firing blind.
+   */
+  pi(command: PiCommand): void;
   close(): void;
 }
 
@@ -226,7 +254,7 @@ export function connect(
   }
 
   function retryHello() {
-    raw({ type: "hello", sessionId: lastHelloSessionId });
+    raw({ type: "hello", sessionId: lastHelloSessionId, seam: SEAM_VERSION });
   }
 
   function openSocket() {
@@ -239,7 +267,7 @@ export function connect(
     socket.addEventListener("open", () => {
       attempt = 0;
       onState("open");
-      raw({ type: "hello", sessionId: lastHelloSessionId });
+      raw({ type: "hello", sessionId: lastHelloSessionId, seam: SEAM_VERSION });
     });
     const onDrop = () => {
       if (dropHandled) return;
@@ -276,7 +304,10 @@ export function connect(
   return {
     send(text: string) { raw({ type: "send", text }); },
     stop() { raw({ type: "stop" }); },
-    hello(sessionId?: string) { lastHelloSessionId = sessionId; raw({ type: "hello", sessionId }); },
+    hello(sessionId?: string) {
+      lastHelloSessionId = sessionId;
+      raw({ type: "hello", sessionId, seam: SEAM_VERSION });
+    },
     newSession() { raw({ type: "new_session" }); },
     listSessions() { raw({ type: "list_sessions" }); },
     listModels() { raw({ type: "list_models" }); },
@@ -290,6 +321,7 @@ export function connect(
     setModelPrompt(provider: string, modelId: string, prompt: string) {
       raw({ type: "set_model_prompt", provider, modelId, prompt });
     },
+    pi(command: PiCommand) { raw(command); },
     reconnect() {
       manualClose = false;
       attempt = 0;
