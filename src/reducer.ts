@@ -36,6 +36,7 @@ export interface ChatState {
 
 export type Action =
   | { t: "send"; text: string }
+  | { t: "steer"; text: string }
   | { t: "token"; delta: string }
   | { t: "tool_start"; toolCallId: string; name: string; args?: unknown }
   | { t: "tool_update"; toolCallId: string; output: string }
@@ -69,6 +70,17 @@ export function reducer(s: ChatState, a: Action): ChatState {
       const user: Msg = { id: s.nextId, role: "user", text: a.text };
       const assistant: Msg = { id: s.nextId + 1, role: "assistant", text: "" };
       return { messages: [...s.messages, user, assistant], streaming: true, nextId: s.nextId + 2 };
+    }
+    /**
+     * A steered message joins a turn that is ALREADY running (#95), so unlike
+     * `send` it opens no assistant bubble: the reply in flight is the reply,
+     * and adding one would orphan the streaming bubble and send the rest of
+     * the current turn's tokens into the wrong place. `streaming` is likewise
+     * untouched — the run's own events own that.
+     */
+    case "steer": {
+      const user: Msg = { id: s.nextId, role: "user", text: a.text };
+      return { ...s, messages: [...s.messages, user], nextId: s.nextId + 1 };
     }
     case "token": {
       if (!s.streaming) return s;

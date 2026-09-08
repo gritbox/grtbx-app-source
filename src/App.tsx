@@ -3,11 +3,31 @@ import { reducer, initialState, type ToolCall } from "./reducer.ts";
 import { connect, type Conn, type ConnState, type SessionSummary, type ModelSummary, type ModelPromptMap, type WorkspaceSummary } from "./ws.ts";
 import { sheetBody } from "./sheet-state.ts";
 import { modelLabel } from "./model-label.ts";
+import { steerReducer, initialSteer, nextHeld, isQueued, serializeHeld, parseHeld,
+         type SteerState } from "./steering.ts";
 import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
 import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID, type StatusAsk } from "./status-bar.ts";
 
+/**
+ * Lazy initialiser for the held-draft queue. Storage can throw outright (a
+ * browser set to block site data), so a failed restore is an empty queue and
+ * never a blank app.
+ */
+function restoreHeld(): SteerState {
+  try {
+    return { ...initialSteer, held: parseHeld(localStorage.getItem(HELD_KEY)) };
+  } catch {
+    return initialSteer;
+  }
+}
+
 const TOOL_ICON: Record<ToolCall["status"], string> = { running: "", ok: "✓", error: "✗", stopped: "■" };
 const SESSION_KEY = "grtbx:sessionId";
+/** Held drafts outlive a reload because the phone drops its socket routinely
+ *  — backgrounding, a screen lock, a wifi handover (#95, §5). */
+const HELD_KEY = "grtbx:heldDrafts";
+/** How long a press on send must last to mean "steer" rather than "hold". */
+const STEER_HOLD_MS = 500;
 
 // Providers offered in the picker (issue #31, ADR-011; widened in #39). This is
 // a CONVENIENCE LIST, not an allowlist — the field accepts any provider id Pi
@@ -47,6 +67,7 @@ export function App() {
   const [barOpen, setBarOpen] = useState(false);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [draft, setDraft] = useState("");
+  const [steer, dispatchSteer] = useReducer(steerReducer, initialSteer, restoreHeld);
   const [menuOpen, setMenuOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null); // null = never loaded
@@ -120,6 +141,11 @@ export function App() {
   // decides whether the bar is on screen at all.
   const [relaying, setRelaying] = useState(false);
   const statusSeq = useRef(0);
+  const heldSeq = useRef(0);
+  const steerSeq = useRef(0);
+  const pressTimer = useRef<number | null>(null);
+  const steerFired = useRef(false);
+  const wasStreaming = useRef(false);
   // The routing needs the current cursor, and the socket callback captures the
   // first render — so the cursor lives in a ref that an effect keeps in step
   // with the reducer's copy.
@@ -169,6 +195,14 @@ export function App() {
                           sessionIdRef.current !== undefined);
         // A relaying socket gets Pi's events verbatim and none of the bridge's
         // translations, so these ARE the transcript now (ADR-015 clause 5).
+        // Pi's own steering queue (#95). It crosses the relay untranslated: no
+        // reducer action, because nothing in the transcript changes shape — it
+        // only decides which user bubbles are still greyed.
+        const raw = m as unknown as { type?: unknown; steering?: unknown };
+        if (raw.type === "queue_update") {
+          dispatchSteer({ t: "queue_update", steering: Array.isArray(raw.steering) ? (raw.steering as string[]) : [] });
+          return;
+        }
         if (isPiEvent(m as { type?: unknown })) {
           for (const a of piTranslator.current.handle(m as unknown as PiEvent)) dispatch(a);
           return;
@@ -202,6 +236,9 @@ export function App() {
             modelsRequested.current = true;
             connRef.current?.listModels();
           }
+          // Pi's queue belongs to the session that had it. Held drafts are the
+          // user's own words and deliberately survive the switch.
+          dispatchSteer({ t: "reset" });
           dispatch({ t: "load_session", turns: m.turns });
         } else if (m.type === "workspaces") {
           pendingSheetLoad.current.workspaces = false;
@@ -256,6 +293,36 @@ export function App() {
 
   useEffect(() => { cursorRef.current = status.cursor; }, [status.cursor]);
 
+  // Held drafts survive a reload (#95). Storage can throw where site data is
+  // blocked, so a failed write is a lost convenience, never a lost turn.
+  useEffect(() => {
+    try {
+      if (steer.held.length) localStorage.setItem(HELD_KEY, serializeHeld(steer.held));
+      else localStorage.removeItem(HELD_KEY);
+    } catch { /* a draft that cannot be persisted is still usable this session */ }
+  }, [steer.held]);
+
+  /**
+   * A settling run flushes ONE held draft (#95, §5).
+   *
+   * One, not all: sending the second while the first is in flight would put it
+   * straight back into the hold, and §5 values keeping the rest editable over
+   * emptying the queue fast. So each settle takes the oldest and the others
+   * wait their turn, still editable.
+   */
+  useEffect(() => {
+    const settling = wasStreaming.current && !state.streaming;
+    wasStreaming.current = state.streaming;
+    if (!settling) return;
+    if (conn !== "open") return; // the drafts keep; they flush on the next settle
+    const next = nextHeld(steer);
+    if (!next) return;
+    dispatchSteer({ t: "unhold", id: next.id });
+    dispatch({ t: "send", text: next.text });
+    connRef.current?.send(next.text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.streaming, conn]);
+
   useEffect(() => {
     open();
     return () => connRef.current?.close();
@@ -285,6 +352,70 @@ export function App() {
 
   function stop() {
     connRef.current?.stop();
+  }
+
+  /**
+   * Tap send while a run is live (#95, §5).
+   *
+   * The message is kept HERE, not sent to Pi, which is the whole point: a
+   * draft this side of the seam is still editable and still removable, and
+   * Pi's queue offers neither. It leaves as an ordinary prompt once the run
+   * settles.
+   */
+  function holdDraft() {
+    const text = draft.trim();
+    if (!text) return;
+    dispatchSteer({ t: "hold", id: `h${heldSeq.current++}`, text });
+    setDraft("");
+  }
+
+  /** A held draft goes back to the composer to be edited — the same gesture removes it. */
+  function editHeld(id: string, text: string) {
+    dispatchSteer({ t: "unhold", id });
+    setDraft((d) => (d.trim() ? `${d.replace(/\s+$/, "")}\n${text}` : text));
+  }
+
+  /**
+   * Steer: the message reaches Pi at once and the model reads it at the next
+   * tool boundary, so work already in flight is kept rather than thrown away.
+   *
+   * Irreversible, and deliberately so — Pi's RPC has no `clear_queue`, only its
+   * core does, so nothing can take this back. That is why it is the long press
+   * and the reversible hold is the tap.
+   */
+  function steerNow(text: string) {
+    const t = text.trim();
+    if (!t) return;
+    if (!requireConn()) return;
+    // The bubble appears immediately and greys until `queue_update` stops
+    // listing it. Without this the message would be invisible until Pi picked
+    // it up, which on a slow turn is a long time to wonder whether it sent.
+    dispatch({ t: "steer", text: t });
+    connRef.current?.pi({ type: "steer", id: `steer${steerSeq.current++}`, message: t });
+  }
+
+  /** Long-press steers, a tap holds. Pointer events so a mouse hold works too. */
+  function beginSendPress() {
+    steerFired.current = false;
+    if (pressTimer.current !== null) window.clearTimeout(pressTimer.current);
+    pressTimer.current = window.setTimeout(() => {
+      pressTimer.current = null;
+      steerFired.current = true;
+      const text = draft.trim();
+      if (!text) return;
+      steerNow(text);
+      setDraft("");
+    }, STEER_HOLD_MS);
+  }
+
+  function endSendPress(fire: boolean) {
+    if (pressTimer.current !== null) {
+      window.clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+    // The long press already acted; releasing must not also hold the draft.
+    if (fire && !steerFired.current) holdDraft();
+    steerFired.current = false;
   }
 
   /** ws.ts drops frames silently when the socket isn't open — fail visibly instead (issue #6). */
@@ -877,7 +1008,16 @@ export function App() {
                 </div>
               )}
               {!(m.role === "assistant" && m.text === "" && m.tools?.length) && (
-                <div className={`bubble bubble--${m.role}`}>
+                <div
+                  className={`bubble bubble--${m.role}${
+                    m.role === "user" && isQueued(m.text, steer) ? " bubble--queued" : ""
+                  }`}
+                  // Greyed while Pi still lists it (#95, §5). Not a control:
+                  // there is no `clear_queue` on the RPC surface, so a steered
+                  // message cannot be taken back and the greying is the whole
+                  // of the affordance.
+                  title={m.role === "user" && isQueued(m.text, steer) ? "queued — the model reads this at the next tool boundary" : undefined}
+                >
                   {m.role === "assistant" && m.text === "" && state.streaming ? (
                     <span className="typing" aria-label="assistant is replying"><i /><i /><i /></span>
                   ) : (
@@ -943,6 +1083,44 @@ export function App() {
         </div>
       )}
 
+      {steer.held.length > 0 && (
+        <div className="held" aria-label="held messages">
+          {steer.held.map((d) => (
+            <div className="held__chip" key={d.id}>
+              {/* The chip body edits: it returns the text to the composer, which
+                  is also how it is removed. One gesture, both affordances. */}
+              <button
+                type="button"
+                className="held__text"
+                onClick={() => editHeld(d.id, d.text)}
+                aria-label={`edit held message: ${d.text}`}
+              >
+                {d.text}
+              </button>
+              {/* A long press has no keyboard equivalent, so steering would be
+                  unreachable by keyboard or switch control without this (#95). */}
+              <button
+                type="button"
+                className="held__act"
+                onClick={() => { dispatchSteer({ t: "unhold", id: d.id }); steerNow(d.text); }}
+                aria-label={`steer now: ${d.text}`}
+                title="Send now — the model reads it at the next tool boundary. This cannot be undone."
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                className="held__act"
+                onClick={() => dispatchSteer({ t: "unhold", id: d.id })}
+                aria-label={`discard held message: ${d.text}`}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <form className="composer" onSubmit={submit}>
         <textarea
           className="composer__input"
@@ -960,7 +1138,25 @@ export function App() {
           aria-label="message"
         />
         {state.streaming ? (
-          <button type="button" className="btn btn--stop" onClick={stop} aria-label="stop">Stop</button>
+          <>
+            {/* Both, not one: §5's stop is "persistent, always one tap", and
+                swapping Send for Stop is what left no way to queue or steer
+                while the agent worked (#95). */}
+            <button
+              type="button"
+              className="btn btn--send"
+              disabled={!draft.trim() || conn !== "open"}
+              aria-label="queue message"
+              title="Tap to hold this until the run settles. Press and hold to steer it in now."
+              onPointerDown={beginSendPress}
+              onPointerUp={() => endSendPress(true)}
+              onPointerLeave={() => endSendPress(false)}
+              onPointerCancel={() => endSendPress(false)}
+            >
+              Queue
+            </button>
+            <button type="button" className="btn btn--stop" onClick={stop} aria-label="stop">Stop</button>
+          </>
         ) : (
           <button type="submit" className="btn btn--send" disabled={!draft.trim() || conn !== "open"} aria-label="send">
             Send
