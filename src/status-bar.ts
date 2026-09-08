@@ -8,19 +8,33 @@
  *
  *   ↑{input} ↓{output} R{cacheRead} W{cacheWrite} CH{hit}% ${cost} {pct}%/{window} (auto)
  *
- * Two numbers, two sources. The cumulative fields are summed from the session's
- * own entries — the identical walk the footer runs over `entry.message.usage` —
- * so they cost no request at all: `get_entries` once per session, then
- * `entry_appended` as it arrives. Only the context percentage asks Pi, via
- * `get_session_stats`, because only Pi estimates live context across a
- * compaction. That request rides the turn-lifecycle events (an assistant
- * `entry_appended`, `agent_end`, `compaction_end`) and never a timer: an
- * interval would be traffic raised purely to refresh a display, which ADR-010
- * rules out by default. At rest nothing is sent and the Sprite sees nothing.
+ * Pi does the arithmetic, not us. `getSessionStats()` runs the IDENTICAL walk
+ * the footer runs — the same three entry cases through the same
+ * `addUsageToTotals` — so `SessionStats.tokens` and `.cost` already are the
+ * footer's cumulative line, and `contextUsage` rides along in the same answer.
+ * One request gives the whole readout bar one field.
+ *
+ * That one field is the cache hit rate, which the footer takes from the LATEST
+ * assistant message rather than from any total, so it needs entries.
+ * `get_entries` takes a `since` cursor and returns the new `leafId`, so after
+ * the first full read each refresh pulls only what arrived since.
+ *
+ * `entry_appended` is NOT a usage signal, and reading it as one is the trap
+ * here. Pi emits it from exactly one place — `ExtensionActions.appendEntry` →
+ * `appendCustomEntry` (`agent-session.js:1873`, the only emit site in the whole
+ * package) — so it fires for custom entries an EXTENSION writes and never for
+ * an assistant message, a tool result, or a compaction. A client that sums it
+ * shows a cumulative line frozen at whatever the session started with.
+ *
+ * So both requests ride the turn-lifecycle events (`agent_end`,
+ * `compaction_end`) and never a timer: an interval would be traffic raised
+ * purely to refresh a display, which ADR-010 rules out by default. At rest
+ * nothing is sent and the Sprite sees nothing.
  *
  * `SessionStats.tokens.total` is NOT the numerator for the context percentage.
- * It is cumulative over the whole session including history that compaction has
- * since removed, so after a few compactions it exceeds the window outright.
+ * It is the four other fields added together — cumulative over the whole session
+ * including history compaction has since removed — so after a few compactions it
+ * exceeds the window outright. It is what was billed, and nothing else.
  * `contextUsage` is the live estimate, and it has three states, not two: absent
  * entirely (optional field), present with `tokens: null` from a compaction
  * until the next response, or present with a number.
@@ -55,8 +69,10 @@ export interface ContextUsage {
   percent: number | null;
 }
 
-/** The slice of `SessionStats` the bar reads. */
+/** The slice of `SessionStats` the bar reads — which is nearly all of it. */
 export interface SessionStats {
+  tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  cost?: number;
   contextUsage?: ContextUsage;
 }
 
@@ -78,9 +94,12 @@ export interface PiSessionState {
 // --- state ----------------------------------------------------------------
 
 export interface StatusState {
+  /** Pi's own totals, from `get_session_stats`. Never summed here. */
   totals: UsageTotals;
   /** The LATEST assistant message's hit rate, not a session average. */
   cacheHitRate?: number;
+  /** `leafId` from the last `get_entries`, so the next read asks only for new ones. */
+  cursor?: string;
   context?: ContextUsage;
   model?: StatusModel;
   thinkingLevel?: string;
@@ -106,10 +125,12 @@ export const initialStatus: StatusState = {
 };
 
 export type StatusAction =
-  /** A whole session's entries (`get_entries`): REPLACES the totals. */
-  | { t: "entries"; entries: unknown[] }
-  /** One `entry_appended`: adds to them. */
-  | { t: "entry"; entry: unknown }
+  /**
+   * A page of entries. `leafId` becomes the next cursor. `incremental` says the
+   * page was fetched with a `since`, so an absence of assistant messages means
+   * "none arrived", not "the session has none".
+   */
+  | { t: "entries"; entries: unknown[]; leafId?: string | null; incremental: boolean }
   | { t: "stats"; stats: SessionStats }
   | { t: "pi_state"; state: PiSessionState }
   | { t: "thinking"; level: string }
@@ -122,69 +143,56 @@ function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
-function addUsage(t: UsageTotals, u: PiUsage): UsageTotals {
-  return {
-    input: t.input + num(u.input),
-    output: t.output + num(u.output),
-    cacheRead: t.cacheRead + num(u.cacheRead),
-    cacheWrite: t.cacheWrite + num(u.cacheWrite),
-    cost: t.cost + num(u.cost?.total),
-  };
-}
-
 interface EntryShape {
   type?: string;
   message?: { role?: string; usage?: PiUsage };
-  usage?: PiUsage;
 }
 
 /**
- * The footer's own loop: assistant messages, tool results that carry usage, and
- * the summary entries compaction and branching write. Everything else — user
- * messages, model changes, labels — carries no usage and is skipped.
+ * The footer's cache hit rate: `cacheRead / (input + cacheRead + cacheWrite)`
+ * on the LATEST assistant message. Not a session average, and not derivable
+ * from the totals — which is the whole reason entries are read at all.
+ *
+ * `undefined` when the page holds no assistant message; `{ rate: undefined }`
+ * when the newest one had no prompt tokens, which clears a stale rate rather
+ * than leaving the previous one standing.
  */
-function foldEntry(
-  totals: UsageTotals,
-  hitRate: number | undefined,
-  entry: unknown,
-): { totals: UsageTotals; hitRate: number | undefined; changed: boolean } {
-  const e = (entry ?? {}) as EntryShape;
-  if (e.type === "message" && e.message?.role === "assistant") {
+function latestHitRate(entries: unknown[]): { rate: number | undefined } | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = (entries[i] ?? {}) as EntryShape;
+    if (e.type !== "message" || e.message?.role !== "assistant") continue;
     const u = e.message.usage ?? {};
     const prompt = num(u.input) + num(u.cacheRead) + num(u.cacheWrite);
-    // The rate is the latest assistant message's, and a message with no prompt
-    // tokens clears it rather than leaving the previous one standing.
-    return { totals: addUsage(totals, u), hitRate: prompt > 0 ? (num(u.cacheRead) / prompt) * 100 : undefined, changed: true };
+    return { rate: prompt > 0 ? (num(u.cacheRead) / prompt) * 100 : undefined };
   }
-  if (e.type === "message" && e.message?.role === "toolResult" && e.message.usage) {
-    return { totals: addUsage(totals, e.message.usage), hitRate, changed: true };
-  }
-  if ((e.type === "branch_summary" || e.type === "compaction") && e.usage) {
-    return { totals: addUsage(totals, e.usage), hitRate, changed: true };
-  }
-  return { totals, hitRate, changed: false };
+  return undefined;
 }
 
 export function statusReducer(s: StatusState, a: StatusAction): StatusState {
   switch (a.t) {
     case "entries": {
-      // A replace, not an add: this frame is the whole session, and it is
-      // re-fetched after a resume's switch_session lands. Adding would double
-      // every number the second time.
-      let totals = initialStatus.totals;
-      let hitRate: number | undefined;
-      for (const entry of a.entries) ({ totals, hitRate } = foldEntry(totals, hitRate, entry));
-      return { ...s, totals, cacheHitRate: hitRate };
+      const found = latestHitRate(a.entries);
+      // A cursored page with no assistant message means none arrived — the
+      // standing rate is still the latest one. A full read with none means the
+      // session genuinely has none.
+      const cacheHitRate = found ? found.rate : a.incremental ? s.cacheHitRate : undefined;
+      return { ...s, cacheHitRate, cursor: a.leafId ?? s.cursor };
     }
-    case "entry": {
-      const r = foldEntry(s.totals, s.cacheHitRate, a.entry);
-      if (!r.changed) return s;
-      return { ...s, totals: r.totals, cacheHitRate: r.hitRate };
+    case "stats": {
+      // Pi ran the footer's own walk; taking its answer is what keeps the two
+      // from drifting. `contextUsage` is optional, and absent means Pi has no
+      // estimate — not an estimate of zero — so the field goes back to absent.
+      const t = a.stats.tokens ?? {};
+      return {
+        ...s,
+        totals: {
+          input: num(t.input), output: num(t.output),
+          cacheRead: num(t.cacheRead), cacheWrite: num(t.cacheWrite),
+          cost: num(a.stats.cost),
+        },
+        context: a.stats.contextUsage,
+      };
     }
-    case "stats":
-      // `contextUsage` is optional; absent means Pi has no estimate, which is
-      // not the same as an estimate of zero, so the field goes back to absent.
-      return { ...s, context: a.stats.contextUsage };
     case "pi_state":
       return {
         ...s,
@@ -198,6 +206,9 @@ export function statusReducer(s: StatusState, a: StatusAction): StatusState {
       return { ...s, providerCount: a.count };
     case "reset":
       // The model and the provider count outlive a session; the usage does not.
+      // The cursor is a session's entry id — carrying it across would ask the
+      // new session for a `since` it has never heard of, which Pi answers with
+      // an error rather than an empty page.
       return { ...initialStatus, model: s.model, thinkingLevel: s.thinkingLevel,
                autoCompaction: s.autoCompaction, providerCount: s.providerCount };
     default:
@@ -323,8 +334,13 @@ export function readout(s: StatusState): Readout {
  */
 export const STATUS_ID = "grtbx-status:";
 
-/** The Pi reads the bar issues. Both are on the relay list; neither is a write. */
-export type StatusAsk = "get_entries" | "get_session_stats";
+/**
+ * A Pi read the bar issues. `get_entries` carries the cursor when it has one;
+ * both are on the relay list and neither writes anything.
+ */
+export type StatusAsk =
+  | { type: "get_session_stats" }
+  | { type: "get_entries"; since?: string };
 
 export interface StatusRouting {
   actions: StatusAction[];
@@ -332,6 +348,23 @@ export interface StatusRouting {
 }
 
 const NOTHING: StatusRouting = { actions: [], ask: [] };
+
+/** Everything, from the top: the session changed or we have no cursor yet. */
+const FULL: StatusAsk[] = [{ type: "get_session_stats" }, { type: "get_entries" }];
+
+/** A turn ended: Pi's totals again, plus whatever entries are new since. */
+const since = (cursor?: string): StatusAsk[] =>
+  [{ type: "get_session_stats" }, { type: "get_entries", ...(cursor ? { since: cursor } : {}) }];
+
+export interface RouteContext {
+  /**
+   * Whether the `hello` behind this frame named a session, read before that id
+   * is overwritten. When it did, a resume may still be in flight.
+   */
+  couldResume: boolean;
+  /** The last `leafId` seen, if any. */
+  cursor?: string;
+}
 
 /**
  * Everything the bar needs, and only what it needs, out of one inbound frame.
@@ -345,51 +378,58 @@ const NOTHING: StatusRouting = { actions: [], ask: [] };
  * for a `hello` that carried no session id, where no resume was possible. A
  * resumed session with no Pi file on disk gets neither and needs neither: it
  * has no entries, and its window arrives with the bridge's own `get_state`.
- *
- * `couldResume` is whether the `hello` behind this frame named a session, read
- * before that id is overwritten.
  */
 export function routeStatusFrame(
   f: { type?: string; [k: string]: unknown },
-  couldResume: boolean,
+  ctx: RouteContext,
 ): StatusRouting {
   switch (f.type) {
     case "session":
-      // Session-scoped: the totals start over wherever we just landed.
-      return { actions: [{ t: "reset" }], ask: couldResume ? [] : ["get_entries", "get_session_stats"] };
-    case "entry_appended": {
-      const e = f.entry as { type?: string; message?: { role?: string } } | undefined;
-      // An assistant message is the entry that moves the context estimate.
-      const assistant = e?.type === "message" && e.message?.role === "assistant";
-      return { actions: [{ t: "entry", entry: f.entry }], ask: assistant ? ["get_session_stats"] : [] };
-    }
+      // Session-scoped: the readout starts over wherever we just landed.
+      return { actions: [{ t: "reset" }], ask: ctx.couldResume ? [] : FULL };
     case "thinking_level_changed":
       return { actions: [{ t: "thinking", level: String(f.level ?? "off") }], ask: [] };
     // A compaction rewrites the estimate outright. `agent_end` is the end of a
     // loop rather than of the turn (#77), which makes it the earliest honest
-    // moment to re-read — and re-reading twice in a turn costs one request.
+    // moment to re-read — and re-reading twice in a turn costs two cursored
+    // requests, which is what riding real events instead of a timer buys.
     case "compaction_end":
     case "agent_end":
-      return { actions: [], ask: ["get_session_stats"] };
+      return { actions: [], ask: since(ctx.cursor) };
     case "response":
       break;
     default:
+      // `entry_appended` lands here on purpose. Pi emits it only for custom
+      // entries an extension wrote (`agent-session.js:1873` is the sole emit
+      // site), so it carries no usage and is not a turn signal.
       return NOTHING;
   }
 
   // Facts about the session belong to the session, not to whoever asked: the
   // bridge issues `get_state` on every session start and reads every
-  // `set_model` response regardless of sender, on this same reasoning.
-  if (f.command === "switch_session") return { actions: [], ask: ["get_entries", "get_session_stats"] };
-  if (f.success !== true) return NOTHING;
-  if (f.command === "get_state") return { actions: [{ t: "pi_state", state: f.data as PiSessionState }], ask: [] };
-  if (f.command === "set_model") {
+  // `set_model` response regardless of sender, on exactly this reasoning.
+  if (f.command === "switch_session") return { actions: [], ask: FULL };
+  if (f.command === "get_state" && f.success === true) {
+    return { actions: [{ t: "pi_state", state: f.data as PiSessionState }], ask: [] };
+  }
+  if (f.command === "set_model" && f.success === true) {
     return { actions: [{ t: "pi_state", state: { model: f.data as StatusModel } }], ask: [] };
   }
   if (typeof f.id !== "string" || !f.id.startsWith(STATUS_ID)) return NOTHING;
+  if (f.command === "get_entries" && f.success !== true) {
+    // "Entry not found" — a cursor outlives the branch it pointed into whenever
+    // a fork or a compaction rewrites history. Pi answers that with an error
+    // rather than an empty page, so drop the cursor and read the branch whole.
+    return { actions: [], ask: [{ type: "get_entries" }] };
+  }
+  if (f.success !== true) return NOTHING;
   if (f.command === "get_session_stats") return { actions: [{ t: "stats", stats: f.data as SessionStats }], ask: [] };
   if (f.command === "get_entries") {
-    return { actions: [{ t: "entries", entries: (f.data as { entries?: unknown[] })?.entries ?? [] }], ask: [] };
+    const d = (f.data ?? {}) as { entries?: unknown[]; leafId?: string | null };
+    return {
+      actions: [{ t: "entries", entries: d.entries ?? [], leafId: d.leafId, incremental: ctx.cursor !== undefined }],
+      ask: [],
+    };
   }
   return NOTHING;
 }

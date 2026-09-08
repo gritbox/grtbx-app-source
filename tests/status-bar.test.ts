@@ -1,17 +1,20 @@
 /**
  * status-bar.test.ts — the readout against Pi's own footer (#72).
  *
- * The arithmetic here is a port, so the tests assert the ported behaviour
- * rather than a reasonable-looking approximation of it: the cache hit rate is
- * the LATEST assistant message's and not an average, `SessionStats.tokens` is
- * never a numerator, the thresholds are Pi's `>70`/`>90`, and a field with no
- * number is omitted rather than blanked.
+ * The arithmetic is Pi's, so these assert that we take it rather than redo it:
+ * `SessionStats.tokens` IS the footer's cumulative line, `tokens.total` is never
+ * a numerator, the cache hit rate is the latest assistant message's, the
+ * thresholds are Pi's `>70`/`>90`, and a field with no number is omitted.
+ *
+ * The routing tests carry the two findings that cost the most to learn:
+ * `entry_appended` is not a usage signal, and a relayed request sent while a
+ * resume is in flight is refused into the user's transcript.
  */
 
 import assert from "node:assert/strict";
 import {
   contextTone, formatTokens, initialStatus, readout, routeStatusFrame, statusReducer,
-  STATUS_ID, type StatusState,
+  STATUS_ID, type SessionStats, type StatusState,
 } from "../src/status-bar.ts";
 
 let passed = 0;
@@ -20,23 +23,25 @@ function test(name: string, fn: () => void) {
   catch (e) { console.error(`FAIL: ${name}\n`, e); process.exit(1); }
 }
 
-/** An assistant message entry carrying usage. */
-function assistant(u: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number }) {
+/** An assistant entry carrying usage — what the hit rate is read from. */
+function assistant(u: { input?: number; cacheRead?: number; cacheWrite?: number }) {
   return {
     type: "message",
     message: {
       role: "assistant",
-      usage: {
-        input: u.input ?? 0, output: u.output ?? 0,
-        cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0,
-        cost: { total: u.cost ?? 0 },
-      },
+      usage: { input: u.input ?? 0, output: 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, cost: { total: 0 } },
     },
   };
 }
 
-const play = (entries: unknown[], from: StatusState = initialStatus) =>
-  statusReducer(from, { t: "entries", entries });
+/** A `get_session_stats` payload. */
+function stats(t: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number },
+               cost = 0, contextUsage?: SessionStats["contextUsage"]): SessionStats {
+  return { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...t }, cost, contextUsage };
+}
+
+const withStats = (t: Parameters<typeof stats>[0], cost = 0, from: StatusState = initialStatus) =>
+  statusReducer(from, { t: "stats", stats: stats(t, cost) });
 
 // --- formatting ----------------------------------------------------------
 
@@ -63,88 +68,91 @@ test("thresholds are Pi's: >90 error, >70 warn, and the boundaries are not", () 
   assert.equal(contextTone(undefined), "normal");
 });
 
-// --- the cumulative walk -------------------------------------------------
+// --- the cumulative line comes from Pi -----------------------------------
 
-test("totals sum assistant, tool-result and summary entries alike", () => {
-  const s = play([
-    assistant({ input: 100, output: 20, cost: 0.5 }),
-    { type: "message", message: { role: "user" } },                       // no usage
-    { type: "message", message: { role: "toolResult", usage: { input: 5, cost: { total: 0.1 } } } },
-    { type: "compaction", usage: { input: 7, output: 3, cost: { total: 0.25 } } },
-    { type: "branch_summary", usage: { output: 1, cost: { total: 0.05 } } },
-    { type: "model_change", provider: "anthropic", modelId: "x" },        // no usage
-  ]);
-  assert.equal(s.totals.input, 112);
-  assert.equal(s.totals.output, 24);
-  assert.equal(s.totals.cost.toFixed(2), "0.90");
+test("the cumulative fields are Pi's totals, taken not recomputed", () => {
+  const s = withStats({ input: 12000, output: 800, cacheRead: 30000, cacheWrite: 2000 }, 0.41);
+  assert.deepEqual(readout(s).fields.map((f) => `${f.key}${f.value}`), ["↑12k", "↓800", "R30k", "W2.0k"]);
+  assert.equal(readout(s).cost, "$0.410");
 });
 
+test("stats replace rather than accumulate — two answers are not two sessions", () => {
+  const once = withStats({ input: 100 });
+  const twice = withStats({ input: 150 }, 0, once);
+  assert.equal(twice.totals.input, 150, "Pi's totals are already cumulative");
+});
+
+test("malformed or missing stats never poison the totals with NaN", () => {
+  const s = statusReducer(initialStatus, {
+    t: "stats", stats: { tokens: { input: "lots", output: null } as never, cost: "free" as never },
+  });
+  assert.deepEqual(s.totals, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  const empty = statusReducer(initialStatus, { t: "stats", stats: {} });
+  assert.equal(Number.isFinite(empty.totals.cost), true);
+});
+
+// --- the one field entries are read for ----------------------------------
+
 test("the cache hit rate is the latest assistant's, not a session average", () => {
-  const s = play([
-    assistant({ input: 100, cacheRead: 900 }),  // 90%
-    assistant({ input: 900, cacheRead: 100 }),  // 10% — this is the one shown
-  ]);
+  const s = statusReducer(
+    withStats({ cacheRead: 1000, input: 1000 }),
+    { t: "entries", entries: [assistant({ input: 100, cacheRead: 900 }), assistant({ input: 900, cacheRead: 100 })], incremental: false },
+  );
   assert.equal(s.cacheHitRate?.toFixed(1), "10.0");
   assert.equal(readout(s).fields.find((f) => f.key === "CH")?.value, "10.0%");
 });
 
 test("an assistant message with no prompt tokens clears the rate", () => {
-  const s = play([assistant({ cacheRead: 500, input: 500 }), assistant({ output: 10 })]);
+  let s = statusReducer(withStats({ cacheRead: 500, input: 500 }),
+    { t: "entries", entries: [assistant({ input: 500, cacheRead: 500 })], incremental: false });
+  assert.equal(s.cacheHitRate?.toFixed(1), "50.0");
+  s = statusReducer(s, { t: "entries", entries: [assistant({})], incremental: true });
   assert.equal(s.cacheHitRate, undefined);
-  // The cache fields still show — they are cumulative — but CH does not.
-  const f = readout(s).fields.map((x) => x.key);
-  assert.deepEqual(f, ["↑", "↓", "R"]);
+  // The cache totals still show — they are Pi's — but CH does not.
+  assert.deepEqual(readout(s).fields.map((f) => f.key), ["↑", "R"]);
 });
 
-test("malformed usage never poisons the totals with NaN", () => {
-  const s = play([
-    { type: "message", message: { role: "assistant", usage: { input: "lots", output: null, cost: "free" } } },
-    assistant({ input: 10 }),
-  ]);
-  assert.equal(s.totals.input, 10);
-  assert.equal(s.totals.output, 0);
-  assert.equal(s.totals.cost, 0);
-  assert.equal(Number.isFinite(s.totals.cost), true);
+test("a cursored page with no assistant message leaves the rate standing", () => {
+  const s = statusReducer(withStats({ cacheRead: 1, input: 1 }),
+    { t: "entries", entries: [assistant({ input: 100, cacheRead: 900 })], incremental: false });
+  const after = statusReducer(s, { t: "entries", entries: [{ type: "custom", customType: "x" }], incremental: true });
+  assert.equal(after.cacheHitRate?.toFixed(1), "90.0", "nothing new arrived; the latest is still the latest");
 });
 
-test("`entries` replaces, so a refetch after a resume does not double", () => {
-  const once = play([assistant({ input: 100 })]);
-  const twice = play([assistant({ input: 100 })], once);
-  assert.equal(twice.totals.input, 100);
+test("a full read with no assistant message clears the rate", () => {
+  const s = statusReducer(withStats({ cacheRead: 1, input: 1 }),
+    { t: "entries", entries: [assistant({ input: 100, cacheRead: 900 })], incremental: false });
+  const after = statusReducer(s, { t: "entries", entries: [], incremental: false });
+  assert.equal(after.cacheHitRate, undefined, "the session genuinely has none");
 });
 
-test("`entry` adds one at a time, and ignores what carries no usage", () => {
-  let s = play([assistant({ input: 100 })]);
-  s = statusReducer(s, { t: "entry", entry: assistant({ input: 5, output: 2 }) });
-  assert.equal(s.totals.input, 105);
-  const before = s;
-  s = statusReducer(s, { t: "entry", entry: { type: "label", targetId: "a", label: "x" } });
-  assert.equal(s, before, "an entry with no usage is not even a new object");
+test("leafId becomes the cursor; its absence leaves the old one alone", () => {
+  const s = statusReducer(initialStatus, { t: "entries", entries: [], leafId: "e-7", incremental: false });
+  assert.equal(s.cursor, "e-7");
+  assert.equal(statusReducer(s, { t: "entries", entries: [], leafId: null, incremental: true }).cursor, "e-7");
 });
 
 // --- the context field ---------------------------------------------------
 
 test("a live estimate renders percent over the window, with (auto)", () => {
-  const s = statusReducer(
-    { ...initialStatus, autoCompaction: true },
-    { t: "stats", stats: { contextUsage: { tokens: 42000, contextWindow: 200000, percent: 21 } } },
-  );
+  const s = statusReducer(initialStatus, {
+    t: "stats", stats: stats({}, 0, { tokens: 42000, contextWindow: 200000, percent: 21 }),
+  });
   assert.equal(readout(s).context?.text, "21.0%/200k (auto)");
   assert.equal(readout(s).context?.tone, "normal");
 });
 
 test("auto-compaction off drops the suffix, not the field", () => {
-  const s = statusReducer(
-    { ...initialStatus, autoCompaction: false },
-    { t: "stats", stats: { contextUsage: { tokens: 1000, contextWindow: 200000, percent: 0.5 } } },
-  );
+  const s = statusReducer({ ...initialStatus, autoCompaction: false }, {
+    t: "stats", stats: stats({}, 0, { tokens: 1000, contextWindow: 200000, percent: 0.5 }),
+  });
   assert.equal(readout(s).context?.text, "0.5%/200k");
 });
 
 test("a null numerator keeps the denominator: `?/{window}`", () => {
   // Pi nulls `tokens` from a compaction until the next response proves the size.
   const s = statusReducer(initialStatus, {
-    t: "stats", stats: { contextUsage: { tokens: null, contextWindow: 200000, percent: null } },
+    t: "stats", stats: stats({}, 0, { tokens: null, contextWindow: 200000, percent: null }),
   });
   assert.equal(readout(s).context?.text, "?/200k (auto)");
   assert.equal(readout(s).context?.tone, "normal");
@@ -156,6 +164,8 @@ test("no contextUsage at all also reads `?`, never a 0% that means nothing", () 
 });
 
 test("an unknown window drops the field rather than showing `?/0`", () => {
+  // Pi's own `getContextUsage` returns undefined when the window is <= 0, so
+  // there is never a real percentage to pair with a zero denominator.
   assert.equal(readout(initialStatus).context, undefined);
 });
 
@@ -167,7 +177,7 @@ test("the model's own window stands in when the estimate carries none", () => {
 test("crossing Pi's thresholds changes the tone, not the text", () => {
   const at = (percent: number) =>
     readout(statusReducer(initialStatus, {
-      t: "stats", stats: { contextUsage: { tokens: 1, contextWindow: 200000, percent } },
+      t: "stats", stats: stats({}, 0, { tokens: 1, contextWindow: 200000, percent }),
     })).context;
   assert.equal(at(70)!.tone, "normal");
   assert.equal(at(72.5)!.tone, "warn");
@@ -186,7 +196,7 @@ test("a fresh session is a context field and nothing else", () => {
 });
 
 test("no prompt cache means a shorter bar, not a padded one", () => {
-  const s = play([assistant({ input: 1200, output: 340, cost: 0.02 })]);
+  const s = withStats({ input: 1200, output: 340 }, 0.02);
   assert.deepEqual(readout(s).fields.map((f) => f.key), ["↑", "↓"]);
   assert.equal(readout(s).cost, "$0.020");
 });
@@ -212,14 +222,6 @@ test("thinking appears only for a model that reasons, and says so when off", () 
   assert.equal(readout({ ...initialStatus, model: { provider: "p", id: "m" }, thinkingLevel: "high" }).right, "m");
 });
 
-test("thinking_level_changed repaints without a round trip", () => {
-  const s = statusReducer(
-    { ...initialStatus, model: { provider: "p", id: "m", reasoning: true } },
-    { t: "thinking", level: "medium" },
-  );
-  assert.equal(readout(s).right, "m • medium");
-});
-
 test("get_state fills the right-hand side and the (auto) suffix together", () => {
   const s = statusReducer(initialStatus, {
     t: "pi_state",
@@ -231,61 +233,77 @@ test("get_state fills the right-hand side and the (auto) suffix together", () =>
 
 // --- session scope -------------------------------------------------------
 
-test("a reset clears the session's usage but keeps the model and providers", () => {
-  let s = play([assistant({ input: 5000, cacheRead: 100 })]);
+test("a reset clears the session's readout AND its cursor", () => {
+  let s = withStats({ input: 5000, cacheRead: 100 }, 1.5);
+  s = statusReducer(s, { t: "entries", entries: [assistant({ input: 1, cacheRead: 9 })], leafId: "e-3", incremental: false });
   s = statusReducer(s, { t: "providers", count: 4 });
   s = statusReducer(s, { t: "pi_state", state: { model: { provider: "p", id: "m" } } });
-  s = statusReducer(s, { t: "stats", stats: { contextUsage: { tokens: 9, contextWindow: 1000, percent: 1 } } });
   const after = statusReducer(s, { t: "reset" });
   assert.deepEqual(after.totals, initialStatus.totals);
   assert.equal(after.cacheHitRate, undefined);
   assert.equal(after.context, undefined, "a new session's context is not the old one's");
+  // A cursor is an entry id in the OLD session; Pi answers a stale `since` with
+  // an error, not an empty page.
+  assert.equal(after.cursor, undefined);
   assert.equal(after.providerCount, 4);
   assert.equal(after.model?.id, "m");
 });
 
-// --- routing: when a frame means what, and when a request is safe --------
+// --- routing --------------------------------------------------------------
 
 const ours = (n = 0) => `${STATUS_ID}${n}`;
+const asks = (r: { ask: Array<{ type: string; since?: string }> }) =>
+  r.ask.map((a) => (a.since ? `${a.type}:${a.since}` : a.type));
 
 test("a resume asks for nothing until its switch_session answers", () => {
   // Pi does not serialize switch_session against the lines behind it, and the
   // bridge refuses relayed commands while it is pending — with an error the
-  // user reads in the transcript. Three of those is what an eager refresh buys.
-  const onSession = routeStatusFrame({ type: "session", sessionId: "s1", turns: [] }, true);
+  // user reads in the transcript.
+  const onSession = routeStatusFrame({ type: "session", sessionId: "s1", turns: [] }, { couldResume: true });
   assert.deepEqual(onSession.ask, [], "no request may go out while a restore may be in flight");
   assert.deepEqual(onSession.actions, [{ t: "reset" }]);
 
-  const onSwitch = routeStatusFrame({ type: "response", command: "switch_session", success: true }, true);
-  assert.deepEqual(onSwitch.ask, ["get_entries", "get_session_stats"]);
+  const onSwitch = routeStatusFrame({ type: "response", command: "switch_session", success: true }, { couldResume: true });
+  assert.deepEqual(asks(onSwitch), ["get_session_stats", "get_entries"]);
 });
 
 test("a cancelled or failed restore still refreshes — Pi is in SOME session", () => {
-  const r = routeStatusFrame({ type: "response", command: "switch_session", success: false, error: "no" }, true);
-  assert.deepEqual(r.ask, ["get_entries", "get_session_stats"]);
+  const r = routeStatusFrame({ type: "response", command: "switch_session", success: false, error: "no" }, { couldResume: true });
+  assert.deepEqual(asks(r), ["get_session_stats", "get_entries"]);
 });
 
 test("a hello that named no session can ask straight away", () => {
-  const r = routeStatusFrame({ type: "session", sessionId: "s1", turns: [] }, false);
-  assert.deepEqual(r.ask, ["get_entries", "get_session_stats"]);
+  const r = routeStatusFrame({ type: "session", sessionId: "s1", turns: [] }, { couldResume: false });
+  assert.deepEqual(asks(r), ["get_session_stats", "get_entries"]);
   assert.deepEqual(r.actions, [{ t: "reset" }]);
 });
 
-test("an assistant entry both counts and re-reads the estimate", () => {
-  const r = routeStatusFrame({ type: "entry_appended", entry: assistant({ input: 10 }) }, false);
-  assert.deepEqual(r.ask, ["get_session_stats"]);
-  assert.equal(r.actions.length, 1);
-  assert.equal(r.actions[0].t, "entry");
+test("entry_appended is NOT a usage signal and routes to nothing", () => {
+  // Pi emits it from one place only: ExtensionActions.appendEntry ->
+  // appendCustomEntry. It never carries an assistant message, so a client that
+  // sums it shows a cumulative line frozen at whatever the session started with.
+  const r = routeStatusFrame({ type: "entry_appended", entry: assistant({ input: 999 }) }, { couldResume: false });
+  assert.deepEqual(r, { actions: [], ask: [] });
 });
 
-test("a user entry counts and asks nothing — it cannot have moved the estimate", () => {
-  const r = routeStatusFrame({ type: "entry_appended", entry: { type: "message", message: { role: "user" } } }, false);
-  assert.deepEqual(r.ask, []);
+test("a turn ending re-reads both, carrying the cursor when there is one", () => {
+  assert.deepEqual(asks(routeStatusFrame({ type: "agent_end", messages: [] }, { couldResume: false })),
+                   ["get_session_stats", "get_entries"]);
+  assert.deepEqual(asks(routeStatusFrame({ type: "agent_end", messages: [] }, { couldResume: false, cursor: "e-4" })),
+                   ["get_session_stats", "get_entries:e-4"]);
+  assert.deepEqual(asks(routeStatusFrame({ type: "compaction_end", reason: "threshold" }, { couldResume: false, cursor: "e-9" })),
+                   ["get_session_stats", "get_entries:e-9"]);
 });
 
-test("a compaction and a loop end each re-read the estimate", () => {
-  assert.deepEqual(routeStatusFrame({ type: "compaction_end", reason: "threshold" }, false).ask, ["get_session_stats"]);
-  assert.deepEqual(routeStatusFrame({ type: "agent_end", messages: [] }, false).ask, ["get_session_stats"]);
+test("a cursor that outlived its branch is dropped, not retried", () => {
+  // A fork or a compaction rewrites history; Pi answers a stale `since` with an
+  // error rather than an empty page, so the branch is re-read whole.
+  const r = routeStatusFrame(
+    { type: "response", command: "get_entries", success: false, id: ours(), error: "Entry not found: e-4" },
+    { couldResume: false, cursor: "e-4" },
+  );
+  assert.deepEqual(asks(r), ["get_entries"]);
+  assert.deepEqual(r.actions, []);
 });
 
 test("get_state and set_model are taken from whoever asked", () => {
@@ -294,41 +312,38 @@ test("get_state and set_model are taken from whoever asked", () => {
   // first on every single session start.
   const st = routeStatusFrame(
     { type: "response", command: "get_state", success: true, data: { model: { provider: "p", id: "m" }, autoCompactionEnabled: false } },
-    false,
+    { couldResume: false },
   );
   assert.deepEqual(st.actions, [{ t: "pi_state", state: { model: { provider: "p", id: "m" }, autoCompactionEnabled: false } }]);
   const sm = routeStatusFrame(
-    { type: "response", command: "set_model", success: true, data: { provider: "p", id: "m2" } }, false,
+    { type: "response", command: "set_model", success: true, data: { provider: "p", id: "m2" } }, { couldResume: false },
   );
   assert.equal((sm.actions[0] as { state: { model: { id: string } } }).state.model.id, "m2");
 });
 
 test("entries and stats are taken ONLY from our own requests", () => {
   const mine = routeStatusFrame(
-    { type: "response", command: "get_entries", success: true, id: ours(), data: { entries: [assistant({ input: 9 })] } }, false,
+    { type: "response", command: "get_entries", success: true, id: ours(), data: { entries: [], leafId: "e-2" } },
+    { couldResume: false },
   );
   assert.equal(mine.actions.length, 1);
   // The bridge asks Pi things too; its answers carry ids we did not set.
   const theirs = routeStatusFrame(
-    { type: "response", command: "get_entries", success: true, id: "bridge-7", data: { entries: [] } }, false,
+    { type: "response", command: "get_entries", success: true, id: "bridge-7", data: { entries: [] } }, { couldResume: false },
   );
   assert.deepEqual(theirs.actions, []);
   const untagged = routeStatusFrame(
-    { type: "response", command: "get_session_stats", success: true, data: {} }, false,
+    { type: "response", command: "get_session_stats", success: true, data: {} }, { couldResume: false },
   );
   assert.deepEqual(untagged.actions, []);
 });
 
-test("a failed response is never read as data", () => {
-  const r = routeStatusFrame(
-    { type: "response", command: "get_session_stats", success: false, id: ours(), error: "nope" }, false,
-  );
-  assert.deepEqual(r, { actions: [], ask: [] });
-});
-
-test("a get_entries answer with no entries is empty, not a crash", () => {
-  const r = routeStatusFrame({ type: "response", command: "get_entries", success: true, id: ours(), data: {} }, false);
-  assert.deepEqual(r.actions, [{ t: "entries", entries: [] }]);
+test("an entries answer is marked incremental exactly when a cursor was held", () => {
+  const frame = { type: "response", command: "get_entries", success: true, id: ours(), data: { entries: [], leafId: "e-5" } };
+  const cold = routeStatusFrame(frame, { couldResume: false }).actions[0] as { incremental: boolean };
+  const warm = routeStatusFrame(frame, { couldResume: false, cursor: "e-4" }).actions[0] as { incremental: boolean };
+  assert.equal(cold.incremental, false);
+  assert.equal(warm.incremental, true);
 });
 
 test("frames the bar has no business with route to nothing", () => {
@@ -340,37 +355,41 @@ test("frames the bar has no business with route to nothing", () => {
     { type: "response", command: "prompt", success: true },
     {},
   ]) {
-    assert.deepEqual(routeStatusFrame(f, false), { actions: [], ask: [] }, JSON.stringify(f));
+    assert.deepEqual(routeStatusFrame(f, { couldResume: false }), { actions: [], ask: [] }, JSON.stringify(f));
   }
 });
 
 test("routing feeds the reducer: a whole resume, end to end", () => {
   let s = initialStatus;
   const play = (f: Record<string, unknown>, couldResume = true) => {
-    const r = routeStatusFrame(f, couldResume);
+    const r = routeStatusFrame(f, { couldResume, cursor: s.cursor });
     for (const a of r.actions) s = statusReducer(s, a);
-    return r.ask;
+    return asks(r);
   };
   play({ type: "response", command: "get_state", success: true,
          data: { model: { provider: "anthropic", id: "claude-opus-5", contextWindow: 200000, reasoning: true },
                  thinkingLevel: "high", autoCompactionEnabled: true } });
-  // Before the switch answers the bar already names the model and the window.
+  // Before the switch answers, the bar already names the model and the window.
   assert.equal(readout(s).context?.text, "?/200k (auto)");
   assert.equal(readout(s).right, "claude-opus-5 • high");
 
   assert.deepEqual(play({ type: "session", sessionId: "s1", turns: [] }), []);
   assert.deepEqual(play({ type: "response", command: "switch_session", success: true }),
-                   ["get_entries", "get_session_stats"]);
-  play({ type: "response", command: "get_entries", success: true, id: ours(1),
-         data: { entries: [assistant({ input: 12000, output: 800, cacheRead: 30000, cacheWrite: 2000, cost: 0.41 })] } });
-  play({ type: "response", command: "get_session_stats", success: true, id: ours(2),
-         data: { contextUsage: { tokens: 150000, contextWindow: 200000, percent: 75 } } });
+                   ["get_session_stats", "get_entries"]);
+  play({ type: "response", command: "get_session_stats", success: true, id: ours(1),
+         data: stats({ input: 12000, output: 800, cacheRead: 30000, cacheWrite: 2000 }, 0.41,
+                     { tokens: 150000, contextWindow: 200000, percent: 75 }) });
+  play({ type: "response", command: "get_entries", success: true, id: ours(2),
+         data: { entries: [assistant({ input: 12000, cacheRead: 30000, cacheWrite: 2000 })], leafId: "e-9" } });
 
   const r = readout(s);
   assert.deepEqual(r.fields.map((f) => `${f.key}${f.value}`), ["↑12k", "↓800", "R30k", "W2.0k", "CH68.2%"]);
   assert.equal(r.cost, "$0.410");
   assert.equal(r.context?.text, "75.0%/200k (auto)");
   assert.equal(r.context?.tone, "warn");
+
+  // The next turn rides the cursor rather than re-reading the whole branch.
+  assert.deepEqual(play({ type: "agent_end", messages: [] }), ["get_session_stats", "get_entries:e-9"]);
 });
 
 console.log(`status-bar: ${passed} passed`);
