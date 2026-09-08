@@ -2,6 +2,7 @@ import { useEffect, useRef, useReducer, useState } from "react";
 import { reducer, initialState, type ToolCall } from "./reducer.ts";
 import { connect, type Conn, type ConnState, type SessionSummary, type ModelSummary, type ModelPromptMap, type WorkspaceSummary } from "./ws.ts";
 import { sheetBody } from "./sheet-state.ts";
+import { modelLabel } from "./model-label.ts";
 import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
 import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID, type StatusAsk } from "./status-bar.ts";
 
@@ -46,6 +47,7 @@ export function App() {
   const [barOpen, setBarOpen] = useState(false);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [draft, setDraft] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null); // null = never loaded
   const [modelSheetOpen, setModelSheetOpen] = useState(false);
@@ -292,6 +294,28 @@ export function App() {
     return false;
   }
 
+  /**
+   * The overflow menu (issue #92).
+   *
+   * Holds nothing of its own — every item opens one of the sheets that used to
+   * have its own header button. It closes as it hands over, so two overlays are
+   * never stacked.
+   */
+  function openMenu() {
+    setMenuOpen(true);
+  }
+
+  function closeMenu() {
+    setMenuOpen(false);
+  }
+
+  function fromMenu(open: () => void) {
+    return () => {
+      closeMenu();
+      open();
+    };
+  }
+
   function openHistory() {
     setHistoryOpen(true);
     if (conn === "open") {
@@ -472,10 +496,19 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [promptSheetOpen, prompts, currentModel?.provider, currentModel?.modelId]);
 
-  const currentModelLabel =
-    models?.find((m) => m.provider === currentModel?.provider && m.id === currentModel?.modelId)?.name ??
-    currentModel?.modelId ??
-    "Model";
+  const connLabel =
+    conn === "open"
+      ? "connected"
+      : conn === "connecting"
+        ? "connecting…"
+        : conn === "reconnecting"
+          ? "reconnecting…"
+          : "offline";
+
+  const currentModelLabel = modelLabel(
+    models?.find((m) => m.provider === currentModel?.provider && m.id === currentModel?.modelId)?.name,
+    currentModel?.modelId,
+  );
 
   // "offline" is dormant (auto-retry exhausted) — reconnecting needs the banner
   // behind the sheet, so point at it; otherwise a retry is already in flight.
@@ -517,18 +550,27 @@ export function App() {
           )}
         </span>
         <div className="hdr__actions">
-          <button type="button" className="hdr__btn" onClick={openModelPicker} aria-label="model picker">{currentModelLabel}</button>
-          <button type="button" className="hdr__btn" onClick={openPromptEditor} aria-label="system prompt">Prompt</button>
-          <button type="button" className="hdr__btn" onClick={openHistory} aria-label="session history">History</button>
-          <button type="button" className="hdr__btn" onClick={openWorkspaces} aria-label="new session">New</button>
-          <span className={`conn conn--${conn}`} aria-live="polite">
-            {conn === "open"
-              ? "connected"
-              : conn === "connecting"
-                ? "connecting…"
-                : conn === "reconnecting"
-                  ? "reconnecting…"
-                  : "offline"}
+          <button type="button" className="hdr__btn hdr__btn--model" onClick={openModelPicker} aria-label="model picker">{currentModelLabel}</button>
+          {/* Prompt, History and New live behind this (#92). Measured at 320px
+              the four labelled buttons plus the word "connected" needed 289px of
+              a 238px row, so something had to go behind a menu; the model stayed
+              out because it is the only one whose VALUE the header reports. */}
+          <button
+            type="button"
+            className="hdr__btn hdr__btn--more"
+            onClick={openMenu}
+            aria-label="more actions"
+            aria-haspopup="dialog"
+            aria-expanded={menuOpen}
+          >
+            <span aria-hidden="true">⋯</span>
+          </button>
+          {/* A dot, not a word: "connected" cost 63px to say nothing is wrong.
+              The state still reaches a screen reader through the live region,
+              and "offline" additionally raises the banner below. */}
+          <span className={`conn conn--${conn}`} role="status" aria-live="polite">
+            <span className="conn__dot" aria-hidden="true" />
+            <span className="conn__text">{connLabel}</span>
           </span>
         </div>
       </header>
@@ -537,6 +579,31 @@ export function App() {
         <div className="banner" role="alert">
           <span>Connection lost.</span>
           <button type="button" onClick={() => connRef.current?.reconnect()}>Reconnect</button>
+        </div>
+      )}
+
+      {menuOpen && (
+        <div className="sheet" role="dialog" aria-label="more actions">
+          <div className="sheet__panel">
+            <div className="sheet__hdr">
+              <span>Menu</span>
+              <button type="button" className="sheet__close" onClick={closeMenu} aria-label="close">✕</button>
+            </div>
+            <div className="sheet__list">
+              <button type="button" className="sheet__item" onClick={fromMenu(openPromptEditor)} aria-label="system prompt" aria-describedby="menu-prompt-desc">
+                <span className="sheet__item-preview">Prompt</span>
+                <span className="sheet__item-time" id="menu-prompt-desc">Extra instructions for {currentModelLabel}</span>
+              </button>
+              <button type="button" className="sheet__item" onClick={fromMenu(openHistory)} aria-label="session history" aria-describedby="menu-history-desc">
+                <span className="sheet__item-preview">History</span>
+                <span className="sheet__item-time" id="menu-history-desc">Reopen a past session</span>
+              </button>
+              <button type="button" className="sheet__item" onClick={fromMenu(openWorkspaces)} aria-label="new session" aria-describedby="menu-new-desc">
+                <span className="sheet__item-preview">New</span>
+                <span className="sheet__item-time" id="menu-new-desc">Start a chat, and choose where it runs</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
