@@ -3,6 +3,7 @@ import { reducer, initialState, type ToolCall } from "./reducer.ts";
 import { connect, type Conn, type ConnState, type SessionSummary, type ModelSummary, type ModelPromptMap, type WorkspaceSummary } from "./ws.ts";
 import { sheetBody } from "./sheet-state.ts";
 import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
+import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID } from "./status-bar.ts";
 
 const TOOL_ICON: Record<ToolCall["status"], string> = { running: "", ok: "✓", error: "✗", stopped: "■" };
 const SESSION_KEY = "grtbx:sessionId";
@@ -38,6 +39,11 @@ function formatArgs(args: unknown): string {
 
 export function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
+  // The status bar (#72) — Pi's own terminal footer, reproduced rather than
+  // redesigned. Its own reducer: the chat state machine is about messages, and
+  // none of these numbers come from one.
+  const [status, dispatchStatus] = useReducer(statusReducer, initialStatus);
+  const [barOpen, setBarOpen] = useState(false);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [draft, setDraft] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -107,6 +113,11 @@ export function App() {
   // the state `agent_end` carries across to `agent_settled` (#77).
   const piTranslator = useRef(createPiTranslator());
   const relayingRef = useRef(false);
+  // The same fact as `relayingRef`, in a form the render can read. The ref is
+  // what the socket callback sees (it captures the first render); this is what
+  // decides whether the bar is on screen at all.
+  const [relaying, setRelaying] = useState(false);
+  const statusSeq = useRef(0);
 
   function handleConnState(s: ConnState) {
     setConn(s);
@@ -115,17 +126,48 @@ export function App() {
     if (s !== "open") dispatch({ t: "disconnected" });
   }
 
+  /** One of Pi's own read commands, tagged so its answer comes back to us. */
+  function askPi(type: string) {
+    if (!relayingRef.current) return;
+    connRef.current?.pi({ type, id: `${STATUS_ID}${statusSeq.current++}` });
+  }
+
+  /**
+   * The readout's feed (#72). Pi's events and Pi's responses both, which exist
+   * only on a relaying socket — so on a client that never declares the seam
+   * this is inert and the bar never appears, which is the pre-relay path
+   * ADR-014 requires stays intact.
+   *
+   * Nothing here is on a timer. The cumulative fields ride `entry_appended`,
+   * and the one number that needs Pi is asked for on the turn-lifecycle events
+   * that can move it. At rest the bar is static and the Sprite sees nothing,
+   * which is what keeps ADR-010's pause load-bearing. `routeStatusFrame` owns
+   * which frame means what — including when a request is safe to send at all.
+   */
+  function handleStatusFrame(f: { type?: string; [k: string]: unknown }, couldResume: boolean) {
+    const { actions, ask } = routeStatusFrame(f, couldResume);
+    for (const a of actions) dispatchStatus(a);
+    for (const c of ask) askPi(c);
+  }
+
   function open() {
     connRef.current?.close();
     connRef.current = connect(
       (m) => {
+        // The bar reads frames the transcript has no case for — `entry_appended`,
+        // `compaction_end`, Pi's responses — so it looks first and never returns.
+        // `sessionIdRef` is read here, before the `session` branch overwrites
+        // it: whether this socket's `hello` named a session decides whether a
+        // resume could still be in flight, and so whether a request is safe.
+        handleStatusFrame(m as unknown as { type?: string; [k: string]: unknown },
+                          sessionIdRef.current !== undefined);
         // A relaying socket gets Pi's events verbatim and none of the bridge's
         // translations, so these ARE the transcript now (ADR-015 clause 5).
         if (isPiEvent(m as { type?: unknown })) {
           for (const a of piTranslator.current.handle(m as unknown as PiEvent)) dispatch(a);
           return;
         }
-        if (m.type === "seam") { relayingRef.current = m.relaying; return; }
+        if (m.type === "seam") { relayingRef.current = m.relaying; setRelaying(m.relaying); return; }
         if (m.type === "token") dispatch({ t: "token", delta: m.delta });
         else if (m.type === "done") dispatch({ t: "done" });
         else if (m.type === "error") {
@@ -193,6 +235,9 @@ export function App() {
           setCustomModelId("");
           setCustomKey("");
           setModels(m.models);
+          // Pi's footer names the provider only when there is more than one to
+          // tell apart, and the catalog already spans every connected one (#39).
+          dispatchStatus({ t: "providers", count: new Set(m.models.map((x) => x.provider)).size });
           if (m.current) setCurrentModel(m.current);
         } else if (m.type === "model_set") {
           setCurrentModel({ provider: m.provider, modelId: m.modelId });
@@ -439,6 +484,22 @@ export function App() {
     workspaces?.find((w) => w.id === currentWorkspace)?.name ?? currentWorkspace;
 
   const empty = state.messages.length === 0;
+
+  // The bar's two duties in one row (#72): while a run is live the strip shows
+  // the run, at rest it shows the readout, and the readout is right-aligned in
+  // both so the row holds still instead of appearing and disappearing.
+  const bar = readout(status);
+  const runLabel = (() => {
+    if (!state.streaming) return undefined;
+    let last: typeof state.messages[number] | undefined;
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      if (state.messages[i].role === "assistant") { last = state.messages[i]; break; }
+    }
+    const running = last?.tools?.filter((t) => t.status === "running") ?? [];
+    if (running.length === 1) return running[0].name;
+    if (running.length > 1) return `${running.length} tools`;
+    return "replying";
+  })();
 
   return (
     <div className="app">
@@ -755,6 +816,59 @@ export function App() {
           ))
         )}
       </div>
+
+      {/* Only on a relaying socket: every number in it comes from Pi's own
+          stream, so a client that has not declared the seam has nothing to
+          show and shows nothing (ADR-014's pre-relay path, unchanged). */}
+      {relaying && (
+        <div className={`strip${barOpen ? " strip--open" : ""}`}>
+          <button
+            type="button"
+            className="strip__row"
+            onClick={() => setBarOpen((v) => !v)}
+            aria-expanded={barOpen}
+            aria-label="session status"
+          >
+            {runLabel && (
+              <span className="strip__run">
+                <span className="strip__glyph" aria-hidden="true">π</span>
+                {/* Where the row is tight the readout holds its width and the
+                    run description ellipsizes: a number cut in half is wrong
+                    where a description cut short is still true. */}
+                <span className="strip__what">{runLabel}</span>
+              </span>
+            )}
+            <span className="strip__read">
+              {bar.context && (
+                <span className={`strip__ctx strip__ctx--${bar.context.tone}`}>
+                  {bar.context.text}
+                  {bar.context.unverified && (
+                    <span className="strip__mark" title="declared by the endpoint, not verified against the server">*</span>
+                  )}
+                </span>
+              )}
+              {bar.cost && <span className="strip__cost">{bar.cost}</span>}
+            </span>
+            <span className="strip__chev" aria-hidden="true">▾</span>
+          </button>
+          {barOpen && (
+            <div className="strip__body">
+              {bar.fields.length > 0 ? (
+                <div className="strip__fields">
+                  {bar.fields.map((f) => (
+                    <span key={f.key} className="strip__field">
+                      {f.key}<b>{f.value}</b>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="strip__note">No tokens billed to this session yet.</div>
+              )}
+              {bar.right && <div className="strip__meta">{bar.right}</div>}
+            </div>
+          )}
+        </div>
+      )}
 
       <form className="composer" onSubmit={submit}>
         <textarea

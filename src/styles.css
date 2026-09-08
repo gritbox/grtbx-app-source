@@ -9,6 +9,9 @@
   --user: #2b6cf0;
   --err: #3a1c1c;
   --err-line: #6b2b2b;
+  /* Pi's own footer thresholds (#72): > 70% of the context window, then > 90%. */
+  --warn: #d9a657;
+  --hot: #d96757;
 }
 
 * { box-sizing: border-box; }
@@ -343,3 +346,45 @@ body {
 }
 .connect .btn { background: var(--accent); }
 .connect .btn:disabled { opacity: 0.5; }
+
+/* ---- the status bar (#72) ------------------------------------------------
+   Terminal Pi's footer, on a phone. It is the agent strip's RESTING state
+   rather than new chrome: one row with two duties, the run on the left while
+   one is live and the readout right-aligned throughout, so the row holds still
+   instead of appearing and disappearing between turns. Tapping it expands to
+   the full footer, field for field with the terminal's. */
+.strip {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  font-variant-numeric: tabular-nums;
+}
+.strip__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 16px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.strip__run { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--accent); }
+.strip__glyph { font-style: italic; font-weight: 700; }
+/* The readout holds its width; the description is what gives way. */
+.strip__what { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.strip__read { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--muted); white-space: nowrap; }
+.strip__ctx--warn { color: var(--warn); }
+.strip__ctx--error { color: var(--hot); }
+.strip__mark { color: var(--warn); }
+.strip__chev { color: var(--muted); font-size: 10px; transition: transform 120ms ease; }
+.strip--open .strip__chev { transform: rotate(180deg); }
+.strip__body { padding: 0 16px 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+.strip__fields { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); }
+.strip__field b { color: var(--text); font-weight: 600; margin-left: 3px; }
+.strip__meta { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.strip__note { font-size: 12px; color: var(--muted); }
