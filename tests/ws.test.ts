@@ -6,6 +6,7 @@ import {
   RECONNECT_INITIAL_MS,
   RECONNECT_MAX_MS,
   RECONNECT_MAX_ATTEMPTS,
+  SEAM_VERSION,
   type WsEnv,
   type WsLike,
   type ConnState,
@@ -104,7 +105,7 @@ function testHarness(opts: { hidden?: boolean } = {}) {
   assert.deepEqual(h.states, ["connecting"]);
   h.sockets[0].open();
   assert.deepEqual(h.states, ["connecting", "open"]);
-  assert.deepEqual(h.sockets[0].lastSent(), { type: "hello", sessionId: "sess-abc" });
+  assert.deepEqual(h.sockets[0].lastSent(), { type: "hello", sessionId: "sess-abc", seam: SEAM_VERSION });
 }
 
 // a socket drop reconnects with capped exponential backoff and re-hellos with
@@ -122,7 +123,7 @@ function testHarness(opts: { hidden?: boolean } = {}) {
   h.clock.advance(1);
   assert.equal(h.sockets.length, 2, "reconnects after the first backoff (1s)");
   h.sockets[1].open();
-  assert.deepEqual(h.sockets[1].lastSent(), { type: "hello", sessionId: "sess-abc" }, "re-hellos on reconnect");
+  assert.deepEqual(h.sockets[1].lastSent(), { type: "hello", sessionId: "sess-abc", seam: SEAM_VERSION }, "re-hellos on reconnect");
   assert.deepEqual(h.states.slice(-1), ["open"]);
 }
 
@@ -139,7 +140,7 @@ function testHarness(opts: { hidden?: boolean } = {}) {
   h.clock.advance(backoffBaseMs(1));
   assert.equal(h.sockets.length, 2);
   h.sockets[1].open();
-  assert.deepEqual(h.sockets[1].lastSent(), { type: "hello", sessionId: "minted-1" });
+  assert.deepEqual(h.sockets[1].lastSent(), { type: "hello", sessionId: "minted-1", seam: SEAM_VERSION });
 }
 
 // bounded attempts: repeated *consecutive* failures (the network never comes
@@ -219,7 +220,7 @@ function testHarness(opts: { hidden?: boolean } = {}) {
   h.clock.advance(backoffBaseMs(1));
   assert.equal(h.sockets.length, 1);
   assert.equal(h.sockets[0].sent.length, before + 1, "exactly one re-hello sent");
-  assert.deepEqual(h.sockets[0].lastSent(), { type: "hello", sessionId: "sess-abc" });
+  assert.deepEqual(h.sockets[0].lastSent(), { type: "hello", sessionId: "sess-abc", seam: SEAM_VERSION });
 
   // and it's bounded exactly like a socket-drop retry: repeat past the cap
   for (let attempt = 2; attempt <= RECONNECT_MAX_ATTEMPTS; attempt++) {
