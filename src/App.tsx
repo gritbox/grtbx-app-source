@@ -3,7 +3,7 @@ import { reducer, initialState, type ToolCall } from "./reducer.ts";
 import { connect, type Conn, type ConnState, type SessionSummary, type ModelSummary, type ModelPromptMap, type WorkspaceSummary } from "./ws.ts";
 import { sheetBody } from "./sheet-state.ts";
 import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
-import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID } from "./status-bar.ts";
+import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID, type StatusAsk } from "./status-bar.ts";
 
 const TOOL_ICON: Record<ToolCall["status"], string> = { running: "", ok: "✓", error: "✗", stopped: "■" };
 const SESSION_KEY = "grtbx:sessionId";
@@ -118,6 +118,10 @@ export function App() {
   // decides whether the bar is on screen at all.
   const [relaying, setRelaying] = useState(false);
   const statusSeq = useRef(0);
+  // The routing needs the current cursor, and the socket callback captures the
+  // first render — so the cursor lives in a ref that an effect keeps in step
+  // with the reducer's copy.
+  const cursorRef = useRef<string | undefined>(undefined);
 
   function handleConnState(s: ConnState) {
     setConn(s);
@@ -127,9 +131,9 @@ export function App() {
   }
 
   /** One of Pi's own read commands, tagged so its answer comes back to us. */
-  function askPi(type: string) {
+  function askPi(ask: StatusAsk) {
     if (!relayingRef.current) return;
-    connRef.current?.pi({ type, id: `${STATUS_ID}${statusSeq.current++}` });
+    connRef.current?.pi({ ...ask, id: `${STATUS_ID}${statusSeq.current++}` });
   }
 
   /**
@@ -138,14 +142,14 @@ export function App() {
    * this is inert and the bar never appears, which is the pre-relay path
    * ADR-014 requires stays intact.
    *
-   * Nothing here is on a timer. The cumulative fields ride `entry_appended`,
-   * and the one number that needs Pi is asked for on the turn-lifecycle events
-   * that can move it. At rest the bar is static and the Sprite sees nothing,
-   * which is what keeps ADR-010's pause load-bearing. `routeStatusFrame` owns
-   * which frame means what — including when a request is safe to send at all.
+   * Nothing here is on a timer: both reads ride the turn-lifecycle events that
+   * can move the numbers, so at rest the bar is static and the Sprite sees
+   * nothing, which is what keeps ADR-010's pause load-bearing.
+   * `routeStatusFrame` owns which frame means what — including when a request
+   * is safe to send at all, and which cursor it carries.
    */
   function handleStatusFrame(f: { type?: string; [k: string]: unknown }, couldResume: boolean) {
-    const { actions, ask } = routeStatusFrame(f, couldResume);
+    const { actions, ask } = routeStatusFrame(f, { couldResume, cursor: cursorRef.current });
     for (const a of actions) dispatchStatus(a);
     for (const c of ask) askPi(c);
   }
@@ -247,6 +251,8 @@ export function App() {
       sessionIdRef.current,
     );
   }
+
+  useEffect(() => { cursorRef.current = status.cursor; }, [status.cursor]);
 
   useEffect(() => {
     open();
