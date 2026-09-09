@@ -338,6 +338,55 @@ body {
 .btn--send:disabled { opacity: 0.5; }
 .btn--stop { background: #b3402f; }
 
+/* Held drafts (#95, §5) — ours, this side of the seam, and therefore still
+   editable and removable. They sit directly above the composer they came from. */
+.held {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+.held__chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+}
+.held__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 9px 10px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+}
+.held__act {
+  flex: 0 0 auto;
+  min-width: 34px;
+  min-height: 34px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+}
+
+/* A steered message is in Pi and cannot be recalled, so this reports a state
+   rather than offering a control (#95, §5). Dashed, to read as the same
+   "not settled yet" language as the held chip above the composer. */
+.bubble--queued {
+  opacity: 0.55;
+  border: 1px dashed var(--line);
+}
+
 .connect {
   display: flex;
   flex-direction: column;

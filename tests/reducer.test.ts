@@ -170,3 +170,28 @@ function run(actions: Parameters<typeof reducer>[1][]): ChatState {
 }
 
 console.log("reducer.test OK");
+
+// --- steering (#95) -------------------------------------------------------
+// A steered message joins a turn already in flight, so it must NOT open an
+// assistant bubble: the streaming reply is the reply. Getting this wrong
+// orphans the in-flight bubble and lands the rest of the turn's tokens in a
+// new one — which is exactly what the first cut did.
+{
+  const started = reducer(initialState, { t: "send", text: "first" });
+  const streamed = reducer(started, { t: "token", delta: "partial" });
+  const steered = reducer(streamed, { t: "steer", text: "steer me" });
+
+  assert.equal(steered.messages.length, 3, "one bubble added, not two");
+  assert.equal(steered.messages[2].role, "user");
+  assert.equal(steered.messages[2].text, "steer me");
+  assert.equal(steered.streaming, true, "the run's own events own `streaming`");
+
+  const more = reducer(steered, { t: "token", delta: " more" });
+  assert.equal(more.messages[1].text, "partial more",
+    "tokens keep landing in the ASSISTANT bubble that was already streaming");
+  assert.equal(more.messages[2].text, "steer me", "the steered bubble is not written into");
+
+  const ids = more.messages.map((m) => m.id);
+  assert.equal(new Set(ids).size, ids.length, "ids stay unique after a steer");
+}
+console.log("reducer.test steer OK");

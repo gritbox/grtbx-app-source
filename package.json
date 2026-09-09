@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/reducer.test.ts && tsx tests/ws.test.ts && tsx tests/sheet-state.test.ts && tsx tests/pi-events.test.ts && tsx tests/status-bar.test.ts && tsx tests/model-label.test.ts"
+    "test": "tsx tests/reducer.test.ts && tsx tests/ws.test.ts && tsx tests/sheet-state.test.ts && tsx tests/pi-events.test.ts && tsx tests/status-bar.test.ts && tsx tests/model-label.test.ts && tsx tests/steering.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
