@@ -7,6 +7,11 @@ import { steerReducer, initialSteer, nextHeld, isQueued, serializeHeld, parseHel
          type SteerState } from "./steering.ts";
 import { createPiTranslator, isPiEvent, type PiEvent } from "./pi-events.ts";
 import { statusReducer, initialStatus, readout, routeStatusFrame, STATUS_ID, type StatusAsk } from "./status-bar.ts";
+import {
+  slashQuery, filterSlash, isEmpty, CONTROL_VERBS, wouldDropThinking,
+  routeSlashFrame, SLASH_ID, SLASH_READS, choosePiCommand, chooseVerb, verbCommand,
+  type PiSlashCommand, type ControlVerb, type SlashAsk,
+} from "./slash.ts";
 
 /**
  * Lazy initialiser for the held-draft queue. Storage can throw outright (a
@@ -67,6 +72,14 @@ export function App() {
   const [barOpen, setBarOpen] = useState(false);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [draft, setDraft] = useState("");
+  // The slash overlay (#7). Pi's own commands, read once per session; null =
+  // never answered, which is what tells "still loading" from "none registered".
+  const [piCommands, setPiCommands] = useState<PiSlashCommand[] | null>(null);
+  const [thinkingLevels, setThinkingLevels] = useState<string[] | null>(null);
+  // Which verb's second pane is open, if any. A pane suspends the filtering
+  // list without closing the overlay, so `‹ back` returns to it.
+  const [slashPane, setSlashPane] = useState<ControlVerb | null>(null);
+  const [slashText, setSlashText] = useState("");
   const [steer, dispatchSteer] = useReducer(steerReducer, initialSteer, restoreHeld);
   const [menuOpen, setMenuOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -141,6 +154,13 @@ export function App() {
   // decides whether the bar is on screen at all.
   const [relaying, setRelaying] = useState(false);
   const statusSeq = useRef(0);
+  // The overlay hands focus back to the composer after a choice, because the
+  // keyboard must not drop between picking a command and typing its argument.
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const slashSeq = useRef(0);
+  // Pi's command list is fixed at session start, so it is read once per
+  // relaying socket rather than per keystroke.
+  const slashRequested = useRef(false);
   const heldSeq = useRef(0);
   const steerSeq = useRef(0);
   const pressTimer = useRef<number | null>(null);
@@ -162,6 +182,32 @@ export function App() {
   function askPi(ask: StatusAsk) {
     if (!relayingRef.current) return;
     connRef.current?.pi({ ...ask, id: `${STATUS_ID}${statusSeq.current++}` });
+  }
+
+  /**
+   * The overlay's own reads, under their own id prefix so their answers do not
+   * land in the status bar's router and vice versa.
+   *
+   * Issued once per relaying session rather than each time the overlay opens:
+   * Pi's command list changes when extensions load, which is session start, and
+   * re-reading on every `/` would put a request on the wire for a keystroke.
+   */
+  function askSlash(ask: SlashAsk) {
+    if (!relayingRef.current) return;
+    connRef.current?.pi({ ...ask, id: `${SLASH_ID}${slashSeq.current++}` });
+  }
+
+  function handleSlashFrame(f: { type?: string; [k: string]: unknown }) {
+    for (const a of routeSlashFrame(f)) {
+      if (a.t === "commands") setPiCommands(a.commands);
+      else if (a.t === "thinking_levels") setThinkingLevels(a.levels);
+      // A failed read stops the list saying "loading" forever. An empty list is
+      // the honest answer: the family that did answer still works.
+      else if (a.t === "read_failed") {
+        if (a.command === "get_commands") setPiCommands([]);
+        else setThinkingLevels([]);
+      }
+    }
   }
 
   /**
@@ -193,6 +239,9 @@ export function App() {
         // resume could still be in flight, and so whether a request is safe.
         handleStatusFrame(m as unknown as { type?: string; [k: string]: unknown },
                           sessionIdRef.current !== undefined);
+        // The overlay reads frames the transcript has no case for too, and both
+        // routers ignore what is not theirs — they are told apart by id prefix.
+        handleSlashFrame(m as unknown as { type?: string; [k: string]: unknown });
         // A relaying socket gets Pi's events verbatim and none of the bridge's
         // translations, so these ARE the transcript now (ADR-015 clause 5).
         // Pi's own steering queue (#95). It crosses the relay untranslated: no
@@ -207,7 +256,18 @@ export function App() {
           for (const a of piTranslator.current.handle(m as unknown as PiEvent)) dispatch(a);
           return;
         }
-        if (m.type === "seam") { relayingRef.current = m.relaying; setRelaying(m.relaying); return; }
+        if (m.type === "seam") {
+          relayingRef.current = m.relaying;
+          setRelaying(m.relaying);
+          // Only now is `pi()` meaningful — before the bridge answers `hello`
+          // it refuses the name, so the overlay's reads gate on this frame
+          // rather than firing blind.
+          if (m.relaying && !slashRequested.current) {
+            slashRequested.current = true;
+            for (const r of SLASH_READS) askSlash(r);
+          }
+          return;
+        }
         if (m.type === "token") dispatch({ t: "token", delta: m.delta });
         else if (m.type === "done") dispatch({ t: "done" });
         else if (m.type === "error") {
@@ -524,6 +584,59 @@ export function App() {
     connRef.current?.setModel(m.provider, m.id);
   }
 
+  // --- the slash overlay (#7) ---------------------------------------------
+
+  /**
+   * Dismiss the overlay by removing what raised it. The overlay has no open
+   * flag of its own: it is on screen exactly while the composer holds a slash
+   * query or a pane is up, so clearing the draft IS closing it and the two can
+   * never disagree.
+   */
+  function closeSlash() {
+    setSlashPane(null);
+    setSlashText("");
+    setDraft("");
+  }
+
+  /**
+   * Picking one of Pi's commands changes nothing. It writes `/<name> ` into the
+   * composer and the user sends it like any other message — Pi resolves the
+   * prompt at its end. The trailing space also ends the query, which is what
+   * takes the overlay down.
+   */
+  function pickPiCommand(c: PiSlashCommand) {
+    setSlashPane(null);
+    setDraft(choosePiCommand(c).text);
+    composerRef.current?.focus();
+  }
+
+  /** A control verb applies at once, or opens its pane first. Nothing is held. */
+  function pickVerb(v: ControlVerb) {
+    const choice = chooseVerb(v);
+    if (choice.kind === "send") {
+      closeSlash();
+      if (!requireConn()) return;
+      connRef.current?.pi(choice.command);
+      return;
+    }
+    if (choice.kind === "sheet") {
+      closeSlash();
+      openModelPicker();
+      return;
+    }
+    setSlashText("");
+    setSlashPane(choice.verb);
+  }
+
+  /** The pane's answer: one command, sent immediately, then the overlay goes. */
+  function commitVerb(v: ControlVerb, arg: string) {
+    const value = arg.trim();
+    if (v.args.kind === "text" && value.length === 0) return; // nothing to name it
+    closeSlash();
+    if (!requireConn()) return;
+    connRef.current?.pi(verbCommand(v, value));
+  }
+
   /**
    * Per-model system prompts (issue #42).
    *
@@ -654,6 +767,20 @@ export function App() {
     workspaces?.find((w) => w.id === currentWorkspace)?.name ?? currentWorkspace;
 
   const empty = state.messages.length === 0;
+
+  /**
+   * The overlay's state is derived, never stored (#7). It is on screen exactly
+   * while the composer holds a slash query or a pane is up, so there is no open
+   * flag that can disagree with the text — deleting the slash closes it, and
+   * typing a space closes it because the text is a prompt again.
+   *
+   * It needs the relay: `get_commands` is one of Pi's own commands, so a client
+   * that never declared the seam has no list to show. The control verbs are
+   * relayed too, so the whole overlay is a relay feature.
+   */
+  const slashRawQuery = slashQuery(draft);
+  const slashOpen = relaying && (slashRawQuery !== null || slashPane !== null);
+  const slashGroups = filterSlash(slashRawQuery ?? "", piCommands ?? []);
 
   // The bar's two duties in one row (#72): while a run is live the strip shows
   // the run, at rest it shows the readout, and the readout is right-aligned in
@@ -878,17 +1005,28 @@ export function App() {
               ) : (
                 models!.map((m) => {
                   const isCurrent = m.provider === currentModel?.provider && m.id === currentModel?.modelId;
+                  // Switching model re-clamps the thinking level to whatever
+                  // the new model supports, and Pi announces the clamp
+                  // (`thinking_level_changed`) while announcing the model
+                  // change to extensions only. So the readout would repaint
+                  // with the cause invisible. Because the catalog carries
+                  // `reasoning` per model (#79), say it BEFORE the switch.
+                  const drops = !isCurrent && wouldDropThinking(m, status.thinkingLevel);
                   return (
                     <button
                       type="button"
                       key={`${m.provider}/${m.id}`}
                       className={`sheet__item${isCurrent ? " sheet__item--current" : ""}`}
                       onClick={() => selectModel(m)}
+                      title={drops ? `${m.name} cannot think — this would drop thinking from ${status.thinkingLevel} to off.` : undefined}
                     >
                       <span className="sheet__item-preview">{m.name}</span>
                       {/* The catalog now spans every connected provider (#39),
                           so say which one each model belongs to. */}
-                      <span className="sheet__item-time">{isCurrent ? `${m.provider} · current` : m.provider}</span>
+                      <span className="sheet__item-time">
+                        {isCurrent ? `${m.provider} · current` : m.provider}
+                        {drops && <span className="sheet__warn"> · drops thinking</span>}
+                      </span>
                     </button>
                   );
                 })
@@ -1121,12 +1259,124 @@ export function App() {
         </div>
       )}
 
+      {/* The slash overlay (#7). It sits directly above the composer rather
+          than over the screen, because the keyboard stays up while it is open —
+          typing is how the list filters. */}
+      {slashOpen && (
+        <div className="slash" role="listbox" aria-label="commands">
+          {slashPane ? (
+            <>
+              <div className="slash__head">
+                <button
+                  type="button"
+                  className="slash__back"
+                  onClick={() => { setSlashPane(null); composerRef.current?.focus(); }}
+                >
+                  ‹ back
+                </button>
+                <span className="slash__title">/{slashPane.name}</span>
+              </div>
+              {slashPane.args.kind === "text" ? (
+                <form
+                  className="slash__form"
+                  onSubmit={(e) => { e.preventDefault(); commitVerb(slashPane, slashText); }}
+                >
+                  <input
+                    className="slash__input"
+                    value={slashText}
+                    onChange={(e) => setSlashText(e.target.value)}
+                    placeholder={slashPane.args.placeholder}
+                    aria-label={slashPane.args.placeholder}
+                    autoFocus
+                  />
+                  <button type="submit" className="btn btn--send" disabled={!slashText.trim()}>Set</button>
+                </form>
+              ) : thinkingLevels === null ? (
+                <p className="slash__empty">Loading…</p>
+              ) : thinkingLevels.length === 0 ? (
+                <p className="slash__empty">Pi reported no levels.</p>
+              ) : (
+                thinkingLevels.map((l) => (
+                  <button
+                    type="button"
+                    key={l}
+                    className="slash__row slash__row--grtbx"
+                    onClick={() => commitVerb(slashPane, l)}
+                  >
+                    <span className="slash__name">{l}</span>
+                  </button>
+                ))
+              )}
+            </>
+          ) : (
+            <div
+              className="slash__list"
+              /* Reaching into the list to browse means the typing is finished,
+                 so give the screen back. Typing keeps the keyboard, because
+                 typing is how the list narrows. */
+              onTouchMove={() => composerRef.current?.blur()}
+              onScroll={() => composerRef.current?.blur()}
+            >
+              {isEmpty(slashGroups) && <p className="slash__empty">Nothing matches /{slashRawQuery}</p>}
+              {slashGroups.verbs.length > 0 && (
+                <>
+                  <div className="slash__group">grtbx — changes the session</div>
+                  {slashGroups.verbs.map((v) => (
+                    <button
+                      type="button"
+                      key={v.name}
+                      className="slash__row slash__row--grtbx"
+                      onClick={() => pickVerb(v)}
+                    >
+                      <span className="slash__name">/{v.name}</span>
+                      <span className="slash__desc">{v.description}</span>
+                      <span className="slash__src">{v.rpc}</span>
+                    </button>
+                  ))}
+                </>
+              )}
+              {slashGroups.commands.length > 0 && (
+                <>
+                  <div className="slash__group">Pi — resolves to a prompt</div>
+                  {slashGroups.commands.map((c) => (
+                    <button
+                      type="button"
+                      key={c.name}
+                      className="slash__row slash__row--pi"
+                      onClick={() => pickPiCommand(c)}
+                    >
+                      <span className="slash__name">/{c.name}</span>
+                      <span className="slash__desc">{c.description ?? ""}</span>
+                      {c.source && <span className="slash__src">{c.source}</span>}
+                    </button>
+                  ))}
+                </>
+              )}
+              {/* Said once, at the foot, rather than as a row that could be
+                  picked: Pi has not answered yet, so its half is still coming. */}
+              {piCommands === null && relaying && (
+                <p className="slash__empty">Loading Pi's commands…</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       <form className="composer" onSubmit={submit}>
         <textarea
+          ref={composerRef}
           className="composer__input"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) submit(e); }}
+          onKeyDown={(e) => {
+            // Escape takes the overlay down without clearing a draft the user
+            // may still want; only the slash query goes.
+            if (e.key === "Escape" && slashOpen) { e.preventDefault(); closeSlash(); return; }
+            // While the overlay is up, Enter would send the bare query as a
+            // message. Nothing is chosen yet, so it does nothing instead.
+            if (e.key === "Enter" && !e.shiftKey && slashOpen) { e.preventDefault(); return; }
+            if (e.key === "Enter" && !e.shiftKey) submit(e);
+          }}
           placeholder={
             conn === "open"
               ? "Message…"
