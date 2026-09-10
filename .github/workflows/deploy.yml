@@ -1,0 +1,77 @@
+# Deploy the surface when main moves (gritbox/grtbx#103).
+#
+# Nothing deployed on merge before this: the surface was updated by a person
+# running `sprite exec` from a machine holding a browser-completed Fly login,
+# and the live app fell five commits behind without anything reporting it
+# (gritbox/grtbx#100).
+#
+# This workflow holds NO Fly credential. It calls the bridge's own endpoint,
+# which runs the fetch and fast-forward inside the Sprite, so the only secret
+# here is the unlock token — a far smaller thing to leak than an account that
+# can create and destroy machines.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  # Deploying by hand must not mean going back to the CLI.
+  workflow_dispatch:
+
+# A later commit's deploy supersedes an earlier one; never run two at once
+# against the same clone.
+concurrency:
+  group: deploy-surface
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the bridge to pull the surface
+        env:
+          BASE: ${{ secrets.GRTBX_BASE_URL }}
+          TOKEN: ${{ secrets.GRTBX_UNLOCK_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE:-}" ] || [ -z "${TOKEN:-}" ]; then
+            echo "GRTBX_BASE_URL and GRTBX_UNLOCK_TOKEN must both be set as repository secrets." >&2
+            exit 1
+          fi
+
+          # Unlock first: the token goes in the body, never a header, and the
+          # cookie it returns is what authenticates the deploy call.
+          jar=$(mktemp)
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -c "$jar" -X POST \
+            -H 'content-type: application/json' \
+            --data "$(printf '{"token":"%s"}' "$TOKEN")" \
+            "$BASE/unlock")
+          if [ "$code" != "204" ]; then
+            echo "unlock failed (HTTP $code) — is GRTBX_UNLOCK_TOKEN current?" >&2
+            exit 1
+          fi
+
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' -X POST -b "$jar" \
+            "$BASE/control/deploy-surface")
+          cat "$body"; echo
+
+          # 409 is the endpoint declining ON PURPOSE — Pi has uncommitted edits
+          # in the clone, or it has diverged from main. Nothing was touched, and
+          # resolving it is a person's job, so fail loudly rather than retrying
+          # or forcing.
+          case "$code" in
+            200) ;;
+            409) echo "::error::the bridge declined this deploy — see the reason above; the clone was left untouched" >&2; exit 1 ;;
+            *)   echo "::error::deploy failed (HTTP $code)" >&2; exit 1 ;;
+          esac
+
+          # A fast-forward is live immediately because the surface runs under a
+          # Vite dev server — except when dependencies moved, which a merge
+          # alone does not install.
+          if grep -q '"dependenciesChanged":true' "$body"; then
+            echo "::warning::package.json changed — an npm install is still owed on the Sprite"
+          fi
+
+          if grep -q '"changed":false' "$body"; then
+            echo "already current — nothing to deploy"
+          fi
