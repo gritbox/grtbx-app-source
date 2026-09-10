@@ -476,3 +476,80 @@ body {
 .strip__field b { color: var(--text); font-weight: 600; margin-left: 3px; }
 .strip__meta { margin-top: 8px; font-size: 12px; color: var(--muted); }
 .strip__note { font-size: 12px; color: var(--muted); }
+
+/* --- the slash overlay (#7) ------------------------------------------------
+   Above the composer, not over the screen: the keyboard stays up while the
+   list is open, because typing is how the list narrows. Colour carries the
+   two families alongside the group labels — picking one sends a prompt, and
+   picking the other changes the session. */
+.slash {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  max-height: 46vh;
+  display: flex;
+  flex-direction: column;
+}
+.slash__list { overflow-y: auto; overscroll-behavior: contain; }
+.slash__group {
+  position: sticky;
+  top: 0;
+  padding: 8px 16px 4px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: var(--panel);
+}
+.slash__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 11px 16px;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: none;
+  border: 0;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+}
+.slash__row:hover, .slash__row:focus-visible { background: rgba(255, 255, 255, 0.04); outline: none; }
+/* grtbx verbs mutate session state; Pi's commands resolve to a prompt. */
+.slash__row--grtbx { border-left-color: var(--hot); }
+.slash__row--pi { border-left-color: var(--accent); }
+.slash__name { font-weight: 600; white-space: nowrap; }
+.slash__desc {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.slash__src { font-size: 11px; color: var(--muted); opacity: 0.75; white-space: nowrap; }
+.slash__empty { padding: 16px; color: var(--muted); text-align: center; }
+.slash__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.slash__back { font: inherit; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; }
+.slash__title { font-weight: 600; }
+.slash__form { display: flex; gap: 8px; padding: 12px 16px; }
+.slash__input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.slash__input:focus { outline: none; border-color: var(--accent); }
+/* A switch that would drop the thinking level, said before the switch. */
+.sheet__warn { color: var(--warn); }

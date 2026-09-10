@@ -40,6 +40,16 @@ export interface ModelSummary {
   provider: string;
   id: string;
   name: string;
+  /**
+   * Pi's word for thinking support (grtbx#79). The bridge has sent this on
+   * every row since then; declaring it here is what lets the model picker warn
+   * that a switch would drop the thinking level, BEFORE the switch rather than
+   * after it (`slash.ts` — `wouldDropThinking`).
+   *
+   * Optional because a row Pi could not describe is still a model the user may
+   * pick; absent reads as "cannot think", which is how Pi reads it too.
+   */
+  reasoning?: boolean;
 }
 
 /** One place a session can be started (#50): the root, a project, or a sibling
